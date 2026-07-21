@@ -74,6 +74,8 @@ import { Box, Container, Markdown, Text, truncateToWidth, visibleWidth, wrapText
 const DEFAULT_ARCHITECT = "anthropic/claude-fable-5"; // plans, fuses, validates
 const DEFAULT_BUILDER = "openai/gpt-5.6-sol"; // builds (and hosts — see the launch recipes)
 
+// Tool lists are pi-canonical; hosts with a different registry (omp: no find/ls,
+// glob instead) get them translated at spawn time — see "Host CLI dialect" below.
 const READONLY_TOOLS = "read,grep,find,ls"; // parallel agents share a cwd — concurrent writers would collide
 const OPINION_TOOLS = "read,grep,find,ls,bash"; // everything except write/edit
 const FULL_TOOLS = "read,grep,find,ls,bash,edit,write"; // sequential agents (builder, fuser) act freely
@@ -207,6 +209,126 @@ function piInvocation(args: string[]): { command: string; args: string[] } {
 	if (!/^(node|bun)(\.exe)?$/.test(execName)) return { command: process.execPath, args };
 	// Last resort: whatever `pi` resolves to on PATH.
 	return { command: "pi", args };
+}
+
+// ═══ 3.5 Host CLI dialect ════════════════════════════════════════════════════
+// piInvocation() re-runs WHATEVER host is running this extension — and pi derivatives
+// (omp) rename tools and flags, and hard-error where pi is permissive: an unknown
+// `--tools` name or flag aborts the child at argv parsing, before any model work.
+// Two one-time probes (fast exits, no model calls) discover the host's dialect;
+// every child spawn is translated through it. Under pi both probes are identity:
+// its --help lists every flag we emit, and it never prints a "Valid tools:" error.
+
+interface HostDialect {
+	flags: Set<string> | undefined; // --flag names scraped from --help (undefined: probe failed — assume pi)
+	tools: Set<string> | undefined; // the host's --tools registry (undefined: host doesn't validate — pass through)
+}
+
+// pi tool names → acceptable stand-ins on hosts lacking them (first supported wins).
+// `ls` maps to nothing on purpose: hosts that drop it (omp) list directories via `read`,
+// which every list already carries.
+const TOOL_SUBSTITUTES: Record<string, string[]> = { find: ["glob"], ls: [] };
+
+let hostDialectProbe: Promise<HostDialect> | undefined;
+function hostDialect(): Promise<HostDialect> {
+	hostDialectProbe ??= (async () => {
+		const probe = (probeArgs: string[]): Promise<string> =>
+			new Promise((resolve) => {
+				const inv = piInvocation(probeArgs);
+				let out = "";
+				let proc: ReturnType<typeof spawn>;
+				try {
+					proc = spawn(inv.command, inv.args, { shell: false, stdio: ["ignore", "pipe", "pipe"] });
+				} catch {
+					resolve("");
+					return;
+				}
+				const timer = setTimeout(() => {
+					try {
+						proc.kill("SIGKILL");
+					} catch {
+						/* already gone */
+					}
+				}, 15_000);
+				proc.stdout?.on("data", (d: Buffer) => {
+					out += d.toString();
+				});
+				proc.stderr?.on("data", (d: Buffer) => {
+					out += d.toString();
+				});
+				proc.on("close", () => {
+					clearTimeout(timer);
+					resolve(out);
+				});
+				proc.on("error", () => {
+					clearTimeout(timer);
+					resolve("");
+				});
+			});
+		const [help, toolsErr] = await Promise.all([
+			probe(["--help"]),
+			// A bogus tool + --version: a validating host (omp) rejects it BEFORE --version
+			// resolves, printing its full registry ("Valid tools: …"); pi ignores unknown
+			// tool names and just prints its version. Either way: fast exit, no model call.
+			probe(["--tools", "__fh_probe__", "--version"]),
+		]);
+		const flagMatches = help.match(/--[a-z][a-z0-9-]*/g);
+		const toolsMatch = toolsErr.match(/Valid tools:\s*([^\n]+)/i);
+		return {
+			flags: flagMatches ? new Set(flagMatches) : undefined,
+			tools: toolsMatch
+				? new Set(
+						toolsMatch[1]
+							.split(",")
+							.map((t) => t.trim().replace(/[.\s]+$/, ""))
+							.filter(Boolean),
+					)
+				: undefined,
+		};
+	})();
+	return hostDialectProbe;
+}
+
+/** A --flag is emittable when the probe failed (assume pi) or the host's --help lists it. */
+const hasFlag = (d: HostDialect, flag: string): boolean => !d.flags || d.flags.has(flag);
+
+/** Translate a canonical (pi-named) tool list into the host's registry. */
+function translateTools(d: HostDialect, tools: string): string {
+	if (!d.tools) return tools;
+	const out: string[] = [];
+	for (const name of tools
+		.split(",")
+		.map((t) => t.trim())
+		.filter(Boolean)) {
+		const pick = d.tools.has(name) ? name : TOOL_SUBSTITUTES[name]?.find((s) => d.tools?.has(s));
+		if (pick && !out.includes(pick)) out.push(pick);
+	}
+	return out.join(",");
+}
+
+/** translateTools against the (cached) probed dialect. */
+async function resolveTools(tools: string): Promise<string> {
+	return translateTools(await hostDialect(), tools);
+}
+
+/**
+ * Newest session file in a directory — the resume target on hosts without --session-id
+ * (omp): the sessionDir is private to one role+model, so its newest .jsonl IS that
+ * role's brain. Undefined when the role has no session yet (first run starts fresh).
+ */
+function newestSessionFile(dir: string): string | undefined {
+	try {
+		let best: { path: string; mtime: number } | undefined;
+		for (const name of fs.readdirSync(dir)) {
+			if (!name.endsWith(".jsonl")) continue;
+			const p = path.join(dir, name);
+			const st = fs.statSync(p);
+			if (st.isFile() && (!best || st.mtimeMs > best.mtime)) best = { path: p, mtime: st.mtimeMs };
+		}
+		return best?.path;
+	} catch {
+		return undefined;
+	}
 }
 
 /** Truncate by character count, with an explicit elision marker (prompt handoffs). */
@@ -436,7 +558,7 @@ function mdLines(text: string, colW: number): string[] {
  * Final answer = last assistant text part. The child writes its session into a
  * throwaway --session-dir under the run's /tmp artifacts dir.
  */
-function runChild(opts: {
+async function runChild(opts: {
 	run: AgentRun; // mutated live
 	prompt: string;
 	systemPrompt?: string;
@@ -452,6 +574,7 @@ function runChild(opts: {
 }): Promise<AgentRun> {
 	const run = opts.run;
 	run.thinking = opts.thinking;
+	const dialect = await hostDialect();
 	// Clean-room spawn: children never load skills, extensions (recursion guard), or
 	// context files — their entire contract comes from the harness's prompt files.
 	const args: string[] = [
@@ -462,19 +585,35 @@ function runChild(opts: {
 		opts.sessionDir,
 		"--no-skills",
 		"--no-extensions",
-		"--no-context-files",
 		"--thinking",
 		opts.thinking,
 		"--model",
 		run.model,
 	];
+	// pi's --no-context-files ↔ omp's --no-rules: the same clean-room job (no CLAUDE.md/AGENTS.md).
+	if (hasFlag(dialect, "--no-context-files")) args.push("--no-context-files");
+	else if (hasFlag(dialect, "--no-rules")) args.push("--no-rules");
 	// Session identity, in precedence order: fork the host > resume an earlier fork > pinned per-role id.
 	if (opts.fork) args.push("--fork", opts.fork);
 	else if (opts.resume) args.push("--session", opts.resume);
-	else if (opts.sessionId) args.push("--session-id", opts.sessionId);
+	else if (opts.sessionId) {
+		if (hasFlag(dialect, "--session-id")) args.push("--session-id", opts.sessionId);
+		else {
+			// This host cannot DICTATE a fresh session's id (omp has no --session-id).
+			// Resume the role's newest session file by path instead — same continuity,
+			// host-minted ids; the manifest-pinned id only ever names pi sessions.
+			const prev = newestSessionFile(opts.sessionDir);
+			if (prev) args.push("--session", prev);
+		}
+	}
 	if (opts.systemPrompt) args.push("--system-prompt", opts.systemPrompt);
 	if (opts.tools === "none") args.push("--no-tools");
-	else args.push("--tools", opts.tools);
+	else {
+		// Translated per host: a name pi knows (`find`, `ls`) aborts an omp child at argv parsing.
+		const tools = await resolveTools(opts.tools);
+		if (tools) args.push("--tools", tools);
+		else args.push("--no-tools");
+	}
 	args.push(opts.prompt);
 
 	return new Promise<AgentRun>((resolve) => {
@@ -1730,7 +1869,7 @@ export default function (pi: ExtensionAPI) {
 						appendSystemPrompt: undefined,
 						contextFiles: [],
 						skills: [],
-						selectedTools: FULL_TOOLS.split(","),
+						selectedTools: ((await resolveTools(FULL_TOOLS)) || FULL_TOOLS).split(","),
 						cwd: ctx.cwd,
 					});
 				}

@@ -29,11 +29,11 @@ set dotenv-load := true
 
 # WORKHORSE tier — the cheap pair (sonnet-5 plans · terra builds + hosts). Use for testing.
 WORKHORSE_ARCHITECT := "anthropic/claude-sonnet-5"
-WORKHORSE_BUILDER := "openai/gpt-5.6-terra"
+WORKHORSE_BUILDER := "openai-codex/gpt-5.6-terra"
 
 # STATE-OF-THE-ART tier — the frontier, on-camera pair (fable 5 plans · sol builds + hosts).
 SOTA_ARCHITECT := "anthropic/claude-fable-5"
-SOTA_BUILDER := "openai/gpt-5.6-sol"
+SOTA_BUILDER := "openai-codex/gpt-5.6-sol"
 
 default:
     @just --list
